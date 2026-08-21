@@ -242,6 +242,141 @@ app.get('/api/streams/recent', requireAuth, async (req, res) => {
 });
 
 // ==========================================
+// SELF-SERVICE STATS (a user updating their OWN hp/streak/streams)
+// ==========================================
+
+const STAT_COLUMNS = {
+  currentHp: 'current_hp', totalHp: 'total_hp', streakCount: 'streak_count',
+  dailyStreamCount: 'daily_stream_count', weeklyStreamCount: 'weekly_stream_count',
+  totalLifetimeStreams: 'total_lifetime_streams',
+};
+
+app.post('/api/me/stats/increment', requireAuth, async (req, res) => {
+  try {
+    const sets = [];
+    const values = [];
+    let i = 1;
+    for (const [key, column] of Object.entries(STAT_COLUMNS)) {
+      if (typeof req.body[key] === 'number' && req.body[key] !== 0) {
+        sets.push(`${column} = ${column} + $${i}`);
+        values.push(req.body[key]);
+        i++;
+      }
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'No valid stat fields provided.' });
+    values.push(req.user.id);
+    const result = await pool.query(
+      `UPDATE profiles SET ${sets.join(', ')} WHERE id = $${i} RETURNING id, current_hp, total_hp, streak_count, daily_stream_count, weekly_stream_count, total_lifetime_streams`,
+      values
+    );
+    res.json({ success: true, profile: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error updating stats.' });
+  }
+});
+
+app.post('/api/me/stats/reset', requireAuth, async (req, res) => {
+  try {
+    const { scope } = req.body; // 'daily' or 'weekly'
+    let query;
+    if (scope === 'weekly') {
+      query = `UPDATE profiles SET current_hp = 0, weekly_stream_count = 0 WHERE id = $1 RETURNING id, current_hp, total_hp, streak_count, daily_stream_count, weekly_stream_count, total_lifetime_streams`;
+    } else if (scope === 'daily') {
+      query = `UPDATE profiles SET daily_stream_count = 0 WHERE id = $1 RETURNING id, current_hp, total_hp, streak_count, daily_stream_count, weekly_stream_count, total_lifetime_streams`;
+    } else {
+      return res.status(400).json({ error: 'scope must be "daily" or "weekly".' });
+    }
+    const result = await pool.query(query, [req.user.id]);
+    res.json({ success: true, profile: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error resetting stats.' });
+  }
+});
+
+// Combined marker-set + conditional-zero, used atomically by the reset
+// engine so "record that daily/weekly reset X was applied" and "zero the
+// relevant counters" happen in one query, not two separate round trips
+// that could race against each other.
+app.post('/api/me/reset-engine', requireAuth, async (req, res) => {
+  try {
+    const { markers, zeroDaily, zeroWeekly } = req.body || {};
+    const sets = [];
+    const values = [];
+    let i = 1;
+    if (markers && typeof markers.lastDailyResetApplied === 'number') {
+      sets.push(`last_daily_reset_applied = $${i}`); values.push(markers.lastDailyResetApplied); i++;
+    }
+    if (markers && typeof markers.lastWeeklyResetApplied === 'number') {
+      sets.push(`last_weekly_reset_applied = $${i}`); values.push(markers.lastWeeklyResetApplied); i++;
+    }
+    if (zeroDaily) sets.push(`daily_stream_count = 0`);
+    if (zeroWeekly) sets.push(`current_hp = 0, weekly_stream_count = 0`);
+    if (sets.length === 0) return res.status(400).json({ error: 'Nothing to update.' });
+    values.push(req.user.id);
+    const result = await pool.query(
+      `UPDATE profiles SET ${sets.join(', ')} WHERE id = $${i} RETURNING id, current_hp, total_hp, streak_count, daily_stream_count, weekly_stream_count, total_lifetime_streams, last_daily_reset_applied, last_weekly_reset_applied`,
+      values
+    );
+    res.json({ success: true, profile: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error updating reset engine state.' });
+  }
+});
+
+// ==========================================
+// SHARED CONFIG (admin-managed: community channels, playlists, voting reward)
+// ==========================================
+
+app.get('/api/config/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT data FROM shared_config WHERE id = $1', [req.params.id]);
+    res.json(result.rows.length > 0 ? result.rows[0].data : null);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error fetching config.' });
+  }
+});
+
+app.put('/api/config/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO shared_config (id, data, updated_at) VALUES ($1, $2, NOW())
+       ON CONFLICT (id) DO UPDATE SET data = $2, updated_at = NOW()`,
+      [req.params.id, req.body]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error saving config.' });
+  }
+});
+
+// ==========================================
+// NOTIFICATIONS
+// ==========================================
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 30');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error fetching notifications.' });
+  }
+});
+
+app.post('/api/notifications', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { text, severity } = req.body;
+    if (!text) return res.status(400).json({ error: 'text is required.' });
+    const result = await pool.query(
+      `INSERT INTO notifications (text, severity, created_at) VALUES ($1, $2, NOW()) RETURNING *`,
+      [text, severity || 'standard']
+    );
+    res.status(201).json({ success: true, notification: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error publishing notification.' });
+  }
+});
+
+// ==========================================
 // SUPPORT TICKETS
 // ==========================================
 
