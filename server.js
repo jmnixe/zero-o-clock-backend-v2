@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const app = express();
@@ -194,34 +195,76 @@ app.get('/api/profiles/:username', requireAuth, async (req, res) => {
 // STREAMING / SCROBBLES
 // ==========================================
 
-const HP_PER_STREAM = 2;
+// Every 10 completed streams earns 1 HP — not per-stream. Deduplication
+// window protects against a client (webhook retry, flaky connection,
+// duplicate delivery) sending the exact same track twice in a row and
+// inflating the count. This is the ONE place stream-logging happens —
+// the simulate button, the Web Scrobbler webhook, and the
+// ListenBrainz-compatible endpoint all call this same function, so
+// behavior can't quietly diverge between them.
+const STREAMS_PER_HP = 10;
+const DEDUPE_WINDOW_SECONDS = 120;
+
+async function logStreamForUser(userId, { track, artist, platform }) {
+  if (!track || !platform) return { error: 'track and platform are required.' };
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Deduplicate: same user + same track + same artist within the window
+    // is treated as a duplicate delivery, not a second stream.
+    const dupe = await client.query(
+      `SELECT id FROM stream_logs
+       WHERE user_id = $1 AND track = $2 AND COALESCE(artist, '') = COALESCE($3, '')
+         AND created_at > NOW() - INTERVAL '${DEDUPE_WINDOW_SECONDS} seconds'
+       LIMIT 1`,
+      [userId, track, artist || null]
+    );
+    if (dupe.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return { duplicate: true };
+    }
+
+    const log = await client.query(
+      `INSERT INTO stream_logs (user_id, track, artist, platform, created_at)
+       VALUES ($1, $2, $3, $4, NOW()) RETURNING *`,
+      [userId, track, artist || null, platform]
+    );
+
+    // Atomic in one statement: bump both stream counters, and credit
+    // exactly 1 HP only on every 10th total lifetime stream (checked via
+    // modulo on the NEW value, all inside the same UPDATE so there's no
+    // window for a race condition between two near-simultaneous scrobbles
+    // to both think they're "the 10th" and double-credit HP).
+    const updated = await client.query(
+      `UPDATE profiles SET
+         daily_stream_count = daily_stream_count + 1,
+         weekly_stream_count = weekly_stream_count + 1,
+         total_lifetime_streams = total_lifetime_streams + 1,
+         current_hp = current_hp + CASE WHEN (total_lifetime_streams + 1) % $1 = 0 THEN 1 ELSE 0 END,
+         total_hp = total_hp + CASE WHEN (total_lifetime_streams + 1) % $1 = 0 THEN 1 ELSE 0 END
+       WHERE id = $2
+       RETURNING id, current_hp, total_hp, streak_count, daily_stream_count, weekly_stream_count, total_lifetime_streams`,
+      [STREAMS_PER_HP, userId]
+    );
+
+    await client.query('COMMIT');
+    return { log: log.rows[0], profile: updated.rows[0] };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
 app.post('/api/scrobble', requireAuth, async (req, res) => {
   try {
-    const { track, artist, platform } = req.body;
-    if (!track || !platform) return res.status(400).json({ error: 'track and platform are required.' });
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const log = await client.query(
-        `INSERT INTO stream_logs (user_id, track, artist, platform, created_at)
-         VALUES ($1, $2, $3, $4, NOW()) RETURNING *`,
-        [req.user.id, track, artist || null, platform]
-      );
-      const updated = await client.query(
-        `UPDATE profiles SET current_hp = current_hp + $1, total_hp = total_hp + $1
-         WHERE id = $2 RETURNING id, current_hp, total_hp`,
-        [HP_PER_STREAM, req.user.id]
-      );
-      await client.query('COMMIT');
-      res.status(201).json({ success: true, log: log.rows[0], profile: updated.rows[0] });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    const result = await logStreamForUser(req.user.id, req.body);
+    if (result.error) return res.status(400).json({ error: result.error });
+    if (result.duplicate) return res.status(200).json({ success: true, duplicate: true });
+    res.status(201).json({ success: true, log: result.log, profile: result.profile });
   } catch (err) {
     console.error('Scrobble Error:', err);
     res.status(500).json({ error: 'Server error logging stream.' });
@@ -238,6 +281,112 @@ app.get('/api/streams/recent', requireAuth, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error fetching recent streams.' });
+  }
+});
+
+// ==========================================
+// REAL EXTERNAL SCROBBLER INTEGRATION
+// Web Scrobbler's own webhook feature (v3.2.0+), and a ListenBrainz-API-
+// compatible endpoint that both Web Scrobbler's alternate mode and Pano
+// Scrobbler can point at (same pattern self-hosted scrobblers like Maloja
+// use — verified against their real, published API docs before building
+// this, not guessed).
+//
+// Neither of these use JWT auth — external tools can't send an
+// Authorization: Bearer <jwt> header, so a long-lived per-user secret
+// token stands in for it instead: in the URL path for Web Scrobbler's
+// webhook, or a bare "Authorization: Token <token>" header for the
+// ListenBrainz-compatible route (matching ListenBrainz's own real
+// protocol).
+// ==========================================
+
+app.get('/api/me/scrobble-urls', requireAuth, async (req, res) => {
+  try {
+    let result = await pool.query('SELECT scrobble_token FROM profiles WHERE id = $1', [req.user.id]);
+    let token = result.rows[0] && result.rows[0].scrobble_token;
+    if (!token) {
+      token = crypto.randomBytes(24).toString('hex');
+      await pool.query('UPDATE profiles SET scrobble_token = $1 WHERE id = $2', [token, req.user.id]);
+    }
+    const base = `${req.protocol}://${req.get('host')}`;
+    res.json({
+      token,
+      webScrobblerWebhookUrl: `${base}/webhook/web-scrobbler/${token}`,
+      listenBrainzApiUrl: `${base}/webhook/listenbrainz`,
+      listenBrainzToken: token,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error generating scrobble URLs.' });
+  }
+});
+
+async function findUserByScrobbleToken(token) {
+  if (!token) return null;
+  const result = await pool.query('SELECT id FROM profiles WHERE scrobble_token = $1', [token]);
+  return result.rows.length > 0 ? result.rows[0].id : null;
+}
+
+// Web Scrobbler's real webhook payload shape (verified against their
+// published wiki): { eventName, data: { song: { processed, parsed } } }.
+// MUST always return 200, even when ignoring an event — Web Scrobbler
+// treats any non-200 response as a scrobbling failure.
+app.post('/webhook/web-scrobbler/:token', async (req, res) => {
+  try {
+    const userId = await findUserByScrobbleToken(req.params.token);
+    if (!userId) return res.status(200).json({ ignored: true, reason: 'unknown token' });
+
+    const { eventName, data } = req.body || {};
+    if (eventName !== 'scrobble' || !data || !data.song) {
+      return res.status(200).json({ ignored: true, reason: 'not a scrobble event' });
+    }
+    const song = data.song;
+    // Same priority order Web Scrobbler's own code uses internally:
+    // processed metadata (post-editing) wins over raw parsed metadata.
+    const track = (song.processed && song.processed.track) || (song.parsed && song.parsed.track);
+    const artist = (song.processed && song.processed.artist) || (song.parsed && song.parsed.artist);
+    if (!track) return res.status(200).json({ ignored: true, reason: 'no track title' });
+
+    await logStreamForUser(userId, { track, artist, platform: 'Web Scrobbler' });
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Web Scrobbler webhook error:', err);
+    // Still 200 — an internal error on our side shouldn't make the
+    // extension think ITS scrobble failed and retry indefinitely.
+    res.status(200).json({ ignored: true, reason: 'server error' });
+  }
+});
+
+// Real ListenBrainz-compatible submit-listens endpoint. Covers Web
+// Scrobbler's "Custom ListenBrainz" mode AND Pano Scrobbler, since both
+// speak the same real, documented ListenBrainz protocol.
+app.post('/webhook/listenbrainz/1/submit-listens', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Token ') ? authHeader.slice(6) : null;
+    const userId = await findUserByScrobbleToken(token);
+    if (!userId) return res.status(401).json({ code: 401, error: 'Invalid or missing user token.' });
+
+    const { listen_type, payload } = req.body || {};
+    // "playing_now" is a preview ping, not a completed listen — only
+    // "single" (and "import", batch submissions) actually count.
+    if (listen_type !== 'single' && listen_type !== 'import') {
+      return res.status(200).json({ status: 'ok' });
+    }
+    const listens = Array.isArray(payload) ? payload : [];
+    const ua = (req.headers['user-agent'] || '').toLowerCase();
+    // Both real clients identify themselves in their User-Agent — detect
+    // which one actually sent this rather than assuming, since this one
+    // endpoint serves both Pano Scrobbler and Web Scrobbler's alternate mode.
+    const platform = ua.includes('web-scrobbler') || ua.includes('webscrobbler') ? 'Web Scrobbler' : 'Pano Scrobbler';
+    for (const listen of listens) {
+      const meta = listen.track_metadata || {};
+      if (!meta.track_name) continue;
+      await logStreamForUser(userId, { track: meta.track_name, artist: meta.artist_name, platform });
+    }
+    res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    console.error('ListenBrainz-compatible webhook error:', err);
+    res.status(500).json({ code: 500, error: 'Server error.' });
   }
 });
 
