@@ -284,6 +284,20 @@ app.get('/api/streams/recent', requireAuth, async (req, res) => {
   }
 });
 
+// Real count across ALL members in the last 24h — a genuine COUNT query,
+// not the capped 30-row /recent list, so this stays accurate even once
+// more than 30 streams happen in a day.
+app.get('/api/streams/count-24h', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM stream_logs WHERE created_at > NOW() - INTERVAL '24 hours'`
+    );
+    res.json({ count: result.rows[0].count });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error counting streams.' });
+  }
+});
+
 // ==========================================
 // REAL EXTERNAL SCROBBLER INTEGRATION
 // Web Scrobbler's own webhook feature (v3.2.0+), and a ListenBrainz-API-
@@ -387,6 +401,40 @@ app.post('/webhook/listenbrainz/1/submit-listens', async (req, res) => {
   } catch (err) {
     console.error('ListenBrainz-compatible webhook error:', err);
     res.status(500).json({ code: 500, error: 'Server error.' });
+  }
+});
+
+// Real ListenBrainz-compatible token validation. Pano Scrobbler (and Web
+// Scrobbler's "Verify" button) call this before accepting your ListenBrainz
+// instance settings — without it, Verify 404s even when the URL and token
+// are both correct. Matches ListenBrainz's real, documented response shape
+// exactly: { code, message, valid, user_name }. Accepts the token either
+// via "Authorization: Token <token>" header (what real clients send) or a
+// ?token= query param (ListenBrainz's own documented fallback).
+app.get('/webhook/listenbrainz/1/validate-token', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const headerToken = authHeader.startsWith('Token ') ? authHeader.slice(6) : null;
+    const token = headerToken || req.query.token || null;
+
+    if (!token) {
+      return res.status(200).json({ code: 200, message: 'No token provided.', valid: false });
+    }
+
+    const result = await pool.query('SELECT username FROM profiles WHERE scrobble_token = $1', [token]);
+    if (result.rows.length === 0) {
+      return res.status(200).json({ code: 200, message: 'Token invalid.', valid: false });
+    }
+
+    res.status(200).json({
+      code: 200,
+      message: 'Token valid.',
+      valid: true,
+      user_name: result.rows[0].username,
+    });
+  } catch (err) {
+    console.error('validate-token error:', err);
+    res.status(500).json({ code: 500, error: 'Server error validating token.' });
   }
 });
 
