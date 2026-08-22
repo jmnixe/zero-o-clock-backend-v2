@@ -9,6 +9,13 @@ const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Render terminates HTTPS and forwards requests to this app over plain
+// HTTP internally. Without this, req.protocol always reports 'http' even
+// on a real https:// connection, which made every generated scrobble URL
+// (webhook + ListenBrainz API URL) come out wrong. This tells Express to
+// trust Render's X-Forwarded-Proto header instead of guessing.
+app.set('trust proxy', 1);
+
 // ── Required environment variables ──────────────────────────────────
 // DATABASE_URL   → Render Postgres connection string
 // JWT_SECRET     → any long random string, used to sign session tokens
