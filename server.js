@@ -421,14 +421,21 @@ app.post('/webhook/listenbrainz/1/submit-listens', async (req, res) => {
 app.get('/webhook/listenbrainz/1/validate-token', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
-    const headerToken = authHeader.startsWith('Token ') ? authHeader.slice(6) : null;
-    const token = headerToken || req.query.token || null;
+    const headerToken = authHeader.startsWith('Token ') ? authHeader.slice(6).trim() : null;
+    const token = headerToken || (req.query.token ? String(req.query.token).trim() : null);
+
+    // TEMP DEBUG — remove once Pano verifies successfully. Logs exactly
+    // what arrived so a token mismatch can be seen in Render's Logs tab
+    // instead of guessed at. Never logs the full token, only its length
+    // and first/last few characters, so it's still safe to leave visible.
+    console.log('[validate-token] authHeader present:', !!authHeader, '| query.token present:', !!req.query.token, '| resolved token length:', token ? token.length : 0, '| token preview:', token ? (token.slice(0, 6) + '...' + token.slice(-6)) : 'none');
 
     if (!token) {
       return res.status(200).json({ code: 200, message: 'No token provided.', valid: false });
     }
 
     const result = await pool.query('SELECT username FROM profiles WHERE scrobble_token = $1', [token]);
+    console.log('[validate-token] matched a profile:', result.rows.length > 0);
     if (result.rows.length === 0) {
       return res.status(200).json({ code: 200, message: 'Token invalid.', valid: false });
     }
